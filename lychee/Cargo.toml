@@ -1,0 +1,8 @@
+[package]
+name = "lychee"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iced.workspace = true
+lychee-core.workspace = true

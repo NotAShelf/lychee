@@ -1,0 +1,7 @@
+[package]
+name = "lychee-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
