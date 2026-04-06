@@ -1,0 +1,8 @@
+[package]
+name = "lychee-widgets"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iced.workspace = true
+iced_graphics.workspace = true
