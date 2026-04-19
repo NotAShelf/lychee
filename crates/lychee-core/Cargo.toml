@@ -9,3 +9,4 @@ iced.workspace = true
 image.workspace = true
 lychee-cli.workspace = true
 lychee-img.workspace = true
+lychee-widgets.workspace = true
