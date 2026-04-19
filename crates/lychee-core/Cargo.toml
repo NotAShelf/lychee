@@ -1,0 +1,11 @@
+[package]
+name = "lychee-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+iced.workspace = true
+image.workspace = true
+lychee-cli.workspace = true
+lychee-img.workspace = true
