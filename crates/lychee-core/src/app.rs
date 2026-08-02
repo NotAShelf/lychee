@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use iced::event;
 use iced::Point;
+use iced::event;
 use iced::{
-    keyboard,
+    Element, Length, Subscription, Task, keyboard,
     time::{self, milliseconds},
     widget::{column, row},
-    window, Element, Length, Subscription, Task,
+    window,
 };
 use image::GenericImageView;
-use lychee_cli::{Args, Clap};
+use lychee_cli::{Args, Parse};
 use lychee_img::collect_paths;
 use lychee_widgets::ImageCanvas;
 
@@ -17,6 +17,8 @@ use crate::keybindings::handle_key_event;
 
 type ImageCacheKey = (usize, u16, bool, bool);
 type ImageCacheValue = (iced::widget::image::Handle, u32, u32);
+
+const STATUS_BAR_HEIGHT: f32 = 36.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -30,11 +32,8 @@ pub enum Message {
     FitWindow,
     ResetView,
     Pan(i32, i32),
-    CanvasWheelZoom {
-        factor: f32,
-        cursor: Point,
-        viewport_center: Point,
-    },
+    CanvasPan(Point),
+    CanvasZoom { scale: f32, pan_offset: Point },
     RotateCW,
     RotateCCW,
     FlipHorizontal,
@@ -66,6 +65,7 @@ pub struct App {
     scale_step: f32,
     zoom_percent: u32,
     pan_offset: (f32, f32),
+    view_locked: bool,
     // Transform state
     rotation: u16,
     flip_h: bool,
@@ -93,10 +93,11 @@ impl App {
             // Zoom state
             scale: 1.0,
             min_scale: 0.1,
-            max_scale: 10.0,
-            scale_step: 0.1,
+            max_scale: 100.0,
+            scale_step: 0.04,
             zoom_percent: 100,
             pan_offset: (0.0, 0.0),
+            view_locked: false,
             // Transform state
             rotation: 0,
             flip_h: false,
@@ -108,6 +109,7 @@ impl App {
 
         // Preload initial images into cache
         app.preload_adjacent();
+        app.fit_view();
 
         let task = if args.fullscreen {
             window::maximize(window_id, true)
@@ -119,14 +121,20 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        if self.paths.is_empty() {
+            return iced::widget::text("No images found.")
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
         let image_content: Element<'_, Message> =
             match self
                 .image_cache
                 .get(&(self.current, self.rotation, self.flip_h, self.flip_v))
             {
                 Some((handle, width, height)) => {
-                    // Create ImageCanvas with pan/zoom support
-                    // zoom_step = 1 + scale_step (e.g., 1.0 + 0.1 = 1.1 for 10% steps)
+                    // 4% exponential steps match imv's controllable zoom.
                     let zoom_step = 1.0 + self.scale_step;
                     let canvas = ImageCanvas::new(
                         handle.clone(),
@@ -134,22 +142,17 @@ impl App {
                         *height,
                         self.scale,
                         Point::new(self.pan_offset.0, self.pan_offset.1),
+                        self.minimum_scale(),
                         zoom_step,
                     );
 
                     canvas.into_element().map(|msg| match msg {
-                        lychee_widgets::Message::Pan(dx, dy) => Message::Pan(dx as i32, dy as i32),
-                        lychee_widgets::Message::Zoom {
-                            factor,
-                            cursor,
-                            viewport_center,
-                        } => Message::CanvasWheelZoom {
-                            factor,
-                            cursor,
-                            viewport_center,
-                        },
-                        lychee_widgets::Message::ZoomIn => Message::ZoomIn,
-                        lychee_widgets::Message::ZoomOut => Message::ZoomOut,
+                        lychee_widgets::Message::PanTo(pan_offset) => {
+                            Message::CanvasPan(pan_offset)
+                        }
+                        lychee_widgets::Message::ZoomTo { scale, pan_offset } => {
+                            Message::CanvasZoom { scale, pan_offset }
+                        }
                     })
                 }
                 None => iced::widget::text("Loading...").into(),
@@ -171,6 +174,7 @@ impl App {
         ]
         .padding(8)
         .width(Length::Fill)
+        .height(Length::Fixed(STATUS_BAR_HEIGHT))
         .into()
     }
 
@@ -207,19 +211,32 @@ impl App {
 
     fn preload_adjacent(&mut self) {
         for offset in [0isize, -1, 1] {
-            let idx = (self.current as isize + offset) as usize;
+            let Some(idx) = self.current.checked_add_signed(offset) else {
+                continue;
+            };
             let cache_key = (idx, self.rotation, self.flip_h, self.flip_v);
-            if idx < self.paths.len() && !self.image_cache.contains_key(&cache_key) {
+            if idx >= self.paths.len() {
+                continue;
+            }
+
+            if let Some((_, width, height)) = self.image_cache.get(&cache_key) {
+                if idx == self.current {
+                    self.current_image_size = (*width, *height);
+                }
+            } else {
                 // Extract path to avoid borrow conflict
                 let path = self.paths[idx].clone();
                 if let Some(handle_data) = self.load_image(&path) {
+                    if idx == self.current {
+                        self.current_image_size = (handle_data.1, handle_data.2);
+                    }
                     self.image_cache.insert(cache_key, handle_data);
                 }
             }
         }
     }
 
-    fn load_image(&mut self, path: &str) -> Option<(iced::widget::image::Handle, u32, u32)> {
+    fn load_image(&self, path: &str) -> Option<(iced::widget::image::Handle, u32, u32)> {
         let mut img = ::image::open(path).ok()?;
 
         // Apply rotation
@@ -238,10 +255,6 @@ impl App {
             img = img.flipv();
         }
 
-        // Track original image dimensions for fit-to-window calculation
-        let (orig_width, orig_height) = img.dimensions();
-        self.current_image_size = (orig_width, orig_height);
-
         // Load at native resolution - zoom is purely visual via canvas transform
         let (width, height) = img.dimensions();
         let raw = img.to_rgba8().into_raw();
@@ -253,7 +266,9 @@ impl App {
         // Invalidate current and adjacent images when transform changes. Zoom is actually
         // visual only, so it does not invalidate cache.
         for offset in [0isize, -1, 1] {
-            let idx = (self.current as isize + offset) as usize;
+            let Some(idx) = self.current.checked_add_signed(offset) else {
+                continue;
+            };
             let key = (idx, self.rotation, self.flip_h, self.flip_v);
             self.image_cache.remove(&key);
         }
@@ -268,12 +283,77 @@ impl App {
             // Extract path to avoid borrow conflict
             let path = self.paths[self.current].clone();
             if let Some(handle_data) = self.load_image(&path) {
+                self.current_image_size = (handle_data.1, handle_data.2);
                 self.image_cache.insert(key, handle_data);
             }
         }
     }
 
+    fn viewport_size(&self) -> iced::Size {
+        iced::Size::new(
+            self.window_size.0 as f32,
+            (self.window_size.1 as f32 - STATUS_BAR_HEIGHT).max(0.0),
+        )
+    }
+
+    fn fit_scale(&self) -> Option<f32> {
+        let (image_width, image_height) = self.current_image_size;
+        let viewport = self.viewport_size();
+        if image_width == 0 || image_height == 0 || viewport.width == 0.0 || viewport.height == 0.0
+        {
+            return None;
+        }
+
+        Some(
+            (viewport.width / image_width as f32)
+                .min(viewport.height / image_height as f32)
+                .min(self.max_scale),
+        )
+    }
+
+    fn minimum_scale(&self) -> f32 {
+        self.fit_scale()
+            .unwrap_or(self.min_scale)
+            .min(self.min_scale)
+    }
+
+    fn clamp_current_pan(&mut self) {
+        let pan = ImageCanvas::clamp_pan(
+            Point::new(self.pan_offset.0, self.pan_offset.1),
+            self.scale,
+            iced::Size::new(
+                self.current_image_size.0 as f32,
+                self.current_image_size.1 as f32,
+            ),
+            self.viewport_size(),
+        );
+        self.pan_offset = (pan.x, pan.y);
+    }
+
+    fn set_scale(&mut self, scale: f32) {
+        self.scale = scale.clamp(self.minimum_scale(), self.max_scale);
+        self.zoom_percent = (self.scale * 100.0).round() as u32;
+        self.clamp_current_pan();
+    }
+
+    fn fit_view(&mut self) {
+        let Some(scale) = self.fit_scale() else {
+            return;
+        };
+
+        self.scale = scale;
+        self.zoom_percent = (scale * 100.0).round() as u32;
+        self.pan_offset = (0.0, 0.0);
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.paths.is_empty() {
+            return match message {
+                Message::Close => iced::exit(),
+                _ => Task::none(),
+            };
+        }
+
         // Ensure current image is loaded; this handles edge cases where
         // cache miss occurred and preload hasn't triggered yet
         self.ensure_current_loaded();
@@ -283,6 +363,9 @@ impl App {
                 if self.current < self.paths.len() - 1 {
                     self.current += 1;
                     self.preload_adjacent();
+                    if !self.view_locked {
+                        self.fit_view();
+                    }
                 }
                 Task::none()
             }
@@ -290,6 +373,9 @@ impl App {
                 if self.current > 0 {
                     self.current -= 1;
                     self.preload_adjacent();
+                    if !self.view_locked {
+                        self.fit_view();
+                    }
                 }
                 Task::none()
             }
@@ -297,6 +383,9 @@ impl App {
                 if !self.paths.is_empty() {
                     self.current = 0;
                     self.preload_adjacent();
+                    if !self.view_locked {
+                        self.fit_view();
+                    }
                 }
                 Task::none()
             }
@@ -304,55 +393,45 @@ impl App {
                 if !self.paths.is_empty() {
                     self.current = self.paths.len() - 1;
                     self.preload_adjacent();
+                    if !self.view_locked {
+                        self.fit_view();
+                    }
                 }
                 Task::none()
             }
             Message::ZoomIn => {
                 // Zoom is visual only via canvas transform - no cache invalidation
-                let new_percent =
-                    (self.zoom_percent as f32 * (1.0 + self.scale_step)).round() as u32;
-                self.zoom_percent = new_percent.min((self.max_scale * 100.0) as u32);
-                self.scale = self.zoom_percent as f32 / 100.0;
+                self.set_scale(self.scale * (1.0 + self.scale_step));
+                self.view_locked = true;
                 // No cache invalidation - image data unchanged
                 Task::none()
             }
             Message::ZoomOut => {
                 // Zoom is visual only via canvas transform - no cache invalidation
-                let new_percent =
-                    (self.zoom_percent as f32 * (1.0 / (1.0 + self.scale_step))).round() as u32;
-                self.zoom_percent = new_percent.max((self.min_scale * 100.0) as u32);
-                self.scale = self.zoom_percent as f32 / 100.0;
+                self.set_scale(self.scale / (1.0 + self.scale_step));
+                self.view_locked = true;
                 // No cache invalidation - image data unchanged
                 Task::none()
             }
-            Message::ActualSize | Message::FitWindow | Message::ResetView => {
-                let fit_zoom = if self.current_image_size.0 > 0 && self.current_image_size.1 > 0 {
-                    // Calculate zoom to fit image within window, preserving aspect ratio
-                    let window_ratio = (self.window_size.0 as f32) / (self.window_size.1 as f32);
-                    let image_ratio =
-                        (self.current_image_size.0 as f32) / (self.current_image_size.1 as f32);
-
-                    if window_ratio > image_ratio {
-                        // Window is wider than image, fit by height
-                        ((self.window_size.1 as f32) / (self.current_image_size.1 as f32) * 100.0)
-                            as u32
-                    } else {
-                        // Window is taller than image, fit by width
-                        ((self.window_size.0 as f32) / (self.current_image_size.0 as f32) * 100.0)
-                            as u32
-                    }
-                } else {
-                    100 // default to 100% if no image dimensions available
-                };
-
-                self.zoom_percent = fit_zoom.min((self.max_scale * 100.0) as u32);
-                self.scale = self.zoom_percent as f32 / 100.0;
+            Message::ActualSize => {
+                self.scale = 1.0;
+                self.zoom_percent = 100;
                 self.pan_offset = (0.0, 0.0);
-                self.invalidate_cache();
+                self.view_locked = true;
+                Task::none()
+            }
+            Message::FitWindow | Message::ResetView => {
+                self.view_locked = false;
+                self.fit_view();
                 Task::none()
             }
             Message::WindowResized(width, height) => {
                 self.window_size = (width, height);
+                if !self.view_locked {
+                    self.fit_view();
+                } else {
+                    self.clamp_current_pan();
+                }
                 Task::none()
             }
             Message::Pan(dx, dy) => {
@@ -361,59 +440,52 @@ impl App {
                 // Use raw values directly for natural mouse feel
                 self.pan_offset.0 += dx as f32;
                 self.pan_offset.1 += dy as f32;
+                self.clamp_current_pan();
+                self.view_locked = true;
                 Task::none()
             }
-            Message::CanvasWheelZoom {
-                factor,
-                cursor,
-                viewport_center,
-            } => {
-                // Handle wheel zoom from canvas - zoom is visual only. Zoom focuses
-                // around cursor position
-                let old_scale = self.scale;
-                let new_scale = (self.scale * factor).clamp(self.min_scale, self.max_scale);
-
-                // Use viewport center from canvas. NOT window center, because canvas may not fill window
-                // and instead go piss in my cereal. Fuck. FUCK.
-                if (new_scale - old_scale).abs() > f32::EPSILON {
-                    // Calculate cursor offset from viewport center
-                    let cursor_offset =
-                        Point::new(cursor.x - viewport_center.x, cursor.y - viewport_center.y);
-
-                    // Calculate pan adjustment for zoom-around-cursor
-                    // Formula: pan_delta = cursor_offset * (1 - 1/factor) / old_scale
-                    // This keeps the point under cursor stationary during zoom
-                    let pan_delta = (
-                        cursor_offset.x * (1.0 - 1.0 / factor) / old_scale,
-                        cursor_offset.y * (1.0 - 1.0 / factor) / old_scale,
-                    );
-
-                    self.pan_offset.0 += pan_delta.0;
-                    self.pan_offset.1 += pan_delta.1;
-
-                    self.scale = new_scale;
-                    self.zoom_percent = (new_scale * 100.0).round() as u32;
-                }
+            Message::CanvasPan(pan_offset) => {
+                self.pan_offset = (pan_offset.x, pan_offset.y);
+                self.clamp_current_pan();
+                self.view_locked = true;
+                Task::none()
+            }
+            Message::CanvasZoom { scale, pan_offset } => {
+                self.pan_offset = (pan_offset.x, pan_offset.y);
+                self.set_scale(scale);
+                self.view_locked = true;
                 Task::none()
             }
             Message::RotateCW => {
                 self.rotation = (self.rotation + 90) % 360;
                 self.invalidate_cache();
+                if !self.view_locked {
+                    self.fit_view();
+                } else {
+                    self.clamp_current_pan();
+                }
                 Task::none()
             }
             Message::RotateCCW => {
                 self.rotation = (self.rotation + 270) % 360;
                 self.invalidate_cache();
+                if !self.view_locked {
+                    self.fit_view();
+                } else {
+                    self.clamp_current_pan();
+                }
                 Task::none()
             }
             Message::FlipHorizontal => {
                 self.flip_h = !self.flip_h;
                 self.invalidate_cache();
+                self.clamp_current_pan();
                 Task::none()
             }
             Message::FlipVertical => {
                 self.flip_v = !self.flip_v;
                 self.invalidate_cache();
+                self.clamp_current_pan();
                 Task::none()
             }
             Message::ResetTransform => {
@@ -444,10 +516,74 @@ impl App {
                 if self.slideshow_active && !self.paths.is_empty() {
                     self.current = (self.current + 1) % self.paths.len();
                     self.preload_adjacent();
+                    if !self.view_locked {
+                        self.fit_view();
+                    }
                 }
                 Task::none()
             }
             Message::Close => iced::exit(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use iced::window;
+
+    use super::{App, Message};
+
+    fn app_with_image(image_size: (u32, u32)) -> App {
+        App {
+            window_id: window::Id::unique(),
+            paths: vec!["missing-image".to_owned()],
+            current: 0,
+            image_cache: HashMap::new(),
+            fullscreen: false,
+            slideshow_active: false,
+            slideshow_interval: 5,
+            scale: 1.0,
+            min_scale: 0.1,
+            max_scale: 100.0,
+            scale_step: 0.04,
+            zoom_percent: 100,
+            pan_offset: (0.0, 0.0),
+            view_locked: false,
+            rotation: 0,
+            flip_h: false,
+            flip_v: false,
+            window_size: (800, 600),
+            current_image_size: image_size,
+        }
+    }
+
+    #[test]
+    fn empty_image_set_stays_open_without_panicking() {
+        let mut app = app_with_image((0, 0));
+        app.paths.clear();
+
+        let _ = app.update(Message::Next);
+        let _ = app.view();
+    }
+
+    #[test]
+    fn fit_view_allows_scales_below_the_interactive_floor() {
+        let mut app = app_with_image((20_000, 15_000));
+
+        app.fit_view();
+
+        assert!((app.scale - 0.0376).abs() < f32::EPSILON);
+        assert!(app.scale < app.min_scale);
+    }
+
+    #[test]
+    fn keyboard_pan_keeps_part_of_the_image_visible() {
+        let mut app = app_with_image((400, 300));
+
+        let _ = app.update(Message::Pan(10_000, -10_000));
+
+        assert_eq!(app.pan_offset, (600.0, -432.0));
     }
 }
