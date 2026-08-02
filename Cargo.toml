@@ -7,7 +7,7 @@ version = "1.0.0"
 edition = "2024"
 
 [workspace.dependencies]
-clap = { version = "4.6.0", features = ["derive"] }
+pound = "0.1.6"
 iced = { version = "0.14.0", features = ["image", "wayland", "smol", "canvas"] }
 iced_graphics = "0.14.0"
 image = "0.25.10"
