@@ -1,168 +1,109 @@
 use iced::mouse::{self, Cursor, Interaction};
-use iced::widget::canvas::{self, Geometry};
-use iced::widget::canvas::{Cache, Canvas};
+use iced::widget::canvas::{self, Canvas, Geometry};
+use iced::widget::image::Handle;
 use iced::{Element, Length, Point, Rectangle, Renderer, Size, Theme, Vector};
 use iced_graphics::geometry::Image as GraphicsImage;
 
-use iced::Event;
-use iced::widget::image::Handle;
-
-/// Message types emitted by [`ImageCanvas`].
-///
-/// These are used to communicate user interactions to the application.
+/// A complete view update. Offsets are screen pixels relative to the viewport
+/// centre; keeping them in screen space makes dragging and zooming compose
+/// without scale-dependent conversions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Message {
-    /// Pan by the given delta (dx, dy) in screen pixels.
-    Pan(f32, f32),
-    /// Wheel zoom request with cursor and viewport center for zoom-around-cursor.
-    Zoom {
-        factor: f32,
-        cursor: Point,
-        viewport_center: Point,
-    },
-    /// Zoom in.
-    ZoomIn,
-    /// Zoom out.
-    ZoomOut,
+    PanTo(Point),
+    ZoomTo { scale: f32, pan_offset: Point },
 }
 
-/// Interaction state for the canvas.
-///
-/// Tracks the current drag state for panning and visual zoom during drag.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct CanvasInteraction {
-    /// Current visual pan offset during interaction.
+    dragging: Option<Drag>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    start: Point,
     pan_offset: Point,
-    /// Current visual zoom scale during interaction.
-    zoom_scale: f32,
-    /// Whether we're currently dragging.
-    is_dragging: bool,
-    /// Cursor position when drag started.
-    drag_start: Point,
-    /// Pan offset when drag started.
-    initial_pan: Point,
 }
 
-impl Default for CanvasInteraction {
-    fn default() -> Self {
-        Self {
-            pan_offset: Point::ORIGIN,
-            zoom_scale: 1.0,
-            is_dragging: false,
-            drag_start: Point::ORIGIN,
-            initial_pan: Point::ORIGIN,
-        }
-    }
-}
-
-/// A pan/zoom capable canvas widget for image viewing.
+/// An image viewport with cursor-anchored wheel zoom and left-button panning.
 ///
-/// This widget renders an image and provides visual pan and zoom capabilities
-/// through mouse interaction:
-///
-/// - **Mouse drag**: Pan the view
-/// - **Scroll wheel**: Zoom in/out (publishes message for App to handle)
-///
-/// The widget is designed to be integrated with an App that manages the
-/// authoritative state. Mouse events during drag update visual state for
-/// smoothness, but publish messages to sync with App state when interaction ends.
+/// The application owns the view state. The canvas only keeps enough transient
+/// state to turn a drag into an absolute `PanTo` update.
 #[derive(Debug)]
 pub struct ImageCanvas {
-    /// The image data handle.
     handle: Handle,
-    /// Image dimensions in pixels.
-    width: u32,
-    height: u32,
-    /// Authoritative zoom scale from App.
-    zoom_scale: f32,
-    /// Authoritative pan offset from App.
+    image_size: Size,
+    scale: f32,
     pan_offset: Point,
-    /// Minimum zoom scale.
-    min_zoom: f32,
-    /// Maximum zoom scale.
-    max_zoom: f32,
-    /// Zoom step multiplier per scroll tick.
+    min_scale: f32,
+    max_scale: f32,
     zoom_step: f32,
-    /// Geometry cache for rendering.
-    cache: Cache,
 }
 
 impl ImageCanvas {
-    /// Create a new [`ImageCanvas`] from an image handle and dimensions.
-    ///
-    /// # Arguments
-    /// * `handle` - The image handle
-    /// * `width` - Image width in pixels
-    /// * `height` - Image height in pixels
-    /// * `zoom_scale` - Initial zoom scale (1.0 = 100%)
-    /// * `pan_offset` - Initial pan offset
-    /// * `zoom_step` - Zoom multiplier per scroll tick (e.g., 1.1 for 10% steps)
     pub fn new(
         handle: Handle,
         width: u32,
         height: u32,
-        zoom_scale: f32,
+        scale: f32,
         pan_offset: Point,
+        min_scale: f32,
         zoom_step: f32,
     ) -> Self {
         Self {
             handle,
-            width,
-            height,
-            zoom_scale,
+            image_size: Size::new(width as f32, height as f32),
+            scale,
             pan_offset,
-            min_zoom: 0.1,  // 10%
-            max_zoom: 10.0, // 1000%
+            min_scale,
+            max_scale: 100.0,
             zoom_step,
-            cache: Cache::default(),
         }
     }
 
-    /// Apply a zoom factor to the given pan offset, returning adjusted values.
-    ///
-    /// Used by App to calculate new pan when zoom changes.
-    pub fn adjust_pan_for_zoom(pan: Point, old_scale: f32, new_scale: f32, cursor: Point) -> Point {
-        if (new_scale - old_scale).abs() < f32::EPSILON {
-            return pan;
-        }
-
-        let scale_delta = new_scale / old_scale;
-        Point::new(
-            cursor.x - (cursor.x - pan.x) * scale_delta,
-            cursor.y - (cursor.y - pan.y) * scale_delta,
-        )
-    }
-
-    /// Clamp pan offset based on zoom level and viewport size.
-    ///
-    /// Returns the clamped pan offset that keeps the image reasonably visible.
-    pub fn clamp_pan(pan: Point, zoom_scale: f32, viewport: Size) -> Point {
-        // At scale 1.0, no panning needed (image fills viewport)
-        // At scale > 1.0, allow panning to see offscreen parts
-        // At scale < 1.0, limit to keep image centered
-        let max_pan_x = if zoom_scale > 1.0 {
-            (zoom_scale - 1.0) * viewport.width / (2.0 * zoom_scale)
-        } else {
-            (1.0 - zoom_scale) * viewport.width / 2.0
-        };
-        let max_pan_y = if zoom_scale > 1.0 {
-            (zoom_scale - 1.0) * viewport.height / (2.0 * zoom_scale)
-        } else {
-            (1.0 - zoom_scale) * viewport.height / 2.0
-        };
-
-        Point::new(
-            pan.x.clamp(-max_pan_x, max_pan_x),
-            pan.y.clamp(-max_pan_y, max_pan_y),
-        )
-    }
-
-    /// Convert to an Iced element for embedding in UI.
     pub fn into_element(self) -> Element<'static, Message> {
         Canvas::new(self)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// Limits panning so that some of the image remains visible.
+    ///
+    /// This deliberately permits panning an image that fits the viewport. It
+    /// matches imv's direct-manipulation behaviour and avoids a dead drag.
+    pub fn clamp_pan(pan: Point, scale: f32, image_size: Size, viewport: Size) -> Point {
+        let limit = |image: f32, viewport: f32| (image * scale + viewport) / 2.0;
+        let x = limit(image_size.width, viewport.width);
+        let y = limit(image_size.height, viewport.height);
+
+        Point::new(pan.x.clamp(-x, x), pan.y.clamp(-y, y))
+    }
+
+    /// Returns the pan that leaves the image point under `cursor` unchanged
+    /// when changing scale. `cursor` is local to the viewport.
+    pub fn pan_for_zoom(
+        pan: Point,
+        old_scale: f32,
+        new_scale: f32,
+        cursor: Point,
+        viewport: Size,
+    ) -> Point {
+        let factor = new_scale / old_scale;
+        let from_center = Vector::new(
+            cursor.x - viewport.width / 2.0,
+            cursor.y - viewport.height / 2.0,
+        );
+
+        Point::new(
+            factor * pan.x + (1.0 - factor) * from_center.x,
+            factor * pan.y + (1.0 - factor) * from_center.y,
+        )
+    }
+
+    fn local_cursor(cursor: Cursor, bounds: Rectangle) -> Option<Point> {
+        cursor
+            .position()
+            .map(|point| Point::new(point.x - bounds.x, point.y - bounds.y))
     }
 }
 
@@ -171,161 +112,165 @@ impl canvas::Program<Message> for ImageCanvas {
 
     fn update(
         &self,
-        interaction: &mut CanvasInteraction,
-        event: &Event,
+        state: &mut CanvasInteraction,
+        event: &iced::Event,
         bounds: Rectangle,
         cursor: Cursor,
     ) -> Option<canvas::Action<Message>> {
-        let cursor_position = cursor.position_in(bounds)?;
-
         match event {
-            Event::Mouse(mouse_event) => match mouse_event {
-                mouse::Event::ButtonPressed(mouse::Button::Left) => {
-                    // Start panning - initialize interaction state from App state
-                    interaction.pan_offset = self.pan_offset;
-                    interaction.zoom_scale = self.zoom_scale;
-                    interaction.is_dragging = true;
-                    interaction.drag_start = cursor_position;
-                    interaction.initial_pan = self.pan_offset;
-                    Some(canvas::Action::capture())
-                }
-                mouse::Event::ButtonReleased(mouse::Button::Left) => {
-                    if interaction.is_dragging {
-                        interaction.is_dragging = false;
-                        // Publish final pan to sync with App
-                        let dx = interaction.pan_offset.x - self.pan_offset.x;
-                        let dy = interaction.pan_offset.y - self.pan_offset.y;
-                        if dx.abs() > 0.1 || dy.abs() > 0.1 {
-                            return Some(canvas::Action::publish(Message::Pan(dx, dy)));
-                        }
-                    }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let start = cursor.position_in(bounds)?;
+                state.dragging = Some(Drag {
+                    start,
+                    pan_offset: self.pan_offset,
+                });
+                Some(canvas::Action::capture())
+            }
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let drag = state.dragging?;
+                let cursor = Self::local_cursor(cursor, bounds)?;
+                let pan_offset = Self::clamp_pan(
+                    Point::new(
+                        drag.pan_offset.x + cursor.x - drag.start.x,
+                        drag.pan_offset.y + cursor.y - drag.start.y,
+                    ),
+                    self.scale,
+                    self.image_size,
+                    bounds.size(),
+                );
+                Some(canvas::Action::publish(Message::PanTo(pan_offset)))
+            }
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.dragging.take().is_some() {
+                    Some(canvas::Action::request_redraw())
+                } else {
                     None
                 }
-                mouse::Event::CursorMoved { .. } => {
-                    if interaction.is_dragging {
-                        // Calculate delta from drag start position
-                        let dx = cursor_position.x - interaction.drag_start.x;
-                        let dy = cursor_position.y - interaction.drag_start.y;
-
-                        // Update visual pan offset from initial pan
-                        interaction.pan_offset = Point::new(
-                            interaction.initial_pan.x + dx / interaction.zoom_scale,
-                            interaction.initial_pan.y + dy / interaction.zoom_scale,
-                        );
-
-                        return Some(canvas::Action::request_redraw());
-                    }
-                    None
+            }
+            iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let cursor = cursor.position_in(bounds)?;
+                let ticks = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                    // Trackpads report pixels. 60 px is deliberately one wheel
+                    // notch, so both devices have comparable zoom sensitivity.
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / 60.0,
+                };
+                if ticks == 0.0 {
+                    return None;
                 }
-                mouse::Event::WheelScrolled { delta } => {
-                    // Publish zoom message for App to handle
-                    // This ensures App state stays in sync
-                    let factor = match delta {
-                        mouse::ScrollDelta::Lines { y, .. }
-                        | mouse::ScrollDelta::Pixels { y, .. } => {
-                            if *y > 0.0 {
-                                self.zoom_step
-                            } else if *y < 0.0 {
-                                1.0 / self.zoom_step
-                            } else {
-                                1.0
-                            }
-                        }
-                    };
 
-                    if (factor - 1.0).abs() > f32::EPSILON {
-                        // Clamp to valid range
-                        let new_scale =
-                            (self.zoom_scale * factor).clamp(self.min_zoom, self.max_zoom);
-                        if (new_scale - self.zoom_scale).abs() > f32::EPSILON {
-                            // Publish actual factor that produced the clamped value
-                            let clamped_factor = new_scale / self.zoom_scale;
-                            // Calculate viewport center from bounds
-                            let viewport_center =
-                                Point::new(bounds.width / 2.0, bounds.height / 2.0);
-                            // Pass cursor position and viewport center for zoom-around-cursor
-                            return Some(canvas::Action::publish(Message::Zoom {
-                                factor: clamped_factor,
-                                cursor: cursor_position,
-                                viewport_center,
-                            }));
-                        }
-                    }
-                    None
+                let scale =
+                    (self.scale * self.zoom_step.powf(ticks)).clamp(self.min_scale, self.max_scale);
+                if (scale - self.scale).abs() < f32::EPSILON {
+                    return None;
                 }
-                _ => None,
-            },
+
+                let pan_offset = Self::clamp_pan(
+                    Self::pan_for_zoom(self.pan_offset, self.scale, scale, cursor, bounds.size()),
+                    scale,
+                    self.image_size,
+                    bounds.size(),
+                );
+                Some(canvas::Action::publish(Message::ZoomTo {
+                    scale,
+                    pan_offset,
+                }))
+            }
             _ => None,
         }
     }
 
     fn draw(
         &self,
-        interaction: &CanvasInteraction,
+        _state: &CanvasInteraction,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: Cursor,
     ) -> Vec<Geometry> {
-        // Use interaction state if dragging, otherwise use App state
-        let pan_offset = if interaction.is_dragging {
-            interaction.pan_offset
-        } else {
-            self.pan_offset
-        };
-
-        let zoom_scale = if interaction.is_dragging {
-            interaction.zoom_scale
-        } else {
-            self.zoom_scale
-        };
-
-        let center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
-
-        // Draw the image using the cache
-        let geometry = self.cache.draw(renderer, bounds.size(), |frame| {
-            frame.with_save(|frame| {
-                // Move to center of viewport
-                frame.translate(Vector::new(center.x, center.y));
-
-                // Apply zoom (around center)
-                frame.scale(zoom_scale);
-
-                // Apply pan (already in zoomed coordinates)
-                frame.translate(Vector::new(pan_offset.x, pan_offset.y));
-
-                // Center image at origin
-                frame.translate(Vector::new(
-                    -(self.width as f32) / 2.0,
-                    -(self.height as f32) / 2.0,
-                ));
-
-                // Draw the image
-                // Note: We draw at origin since we already translated to center
-                let image = GraphicsImage::new(&self.handle);
-                frame.draw_image(
-                    Rectangle::new(
-                        Point::ORIGIN,
-                        Size::new(self.width as f32, self.height as f32),
-                    ),
-                    image,
-                );
-            });
+        // Do not cache this geometry: panning and zooming deliberately change
+        // the transform on every pointer event.
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        frame.with_save(|frame| {
+            frame.translate(Vector::new(
+                bounds.width / 2.0 + self.pan_offset.x,
+                bounds.height / 2.0 + self.pan_offset.y,
+            ));
+            frame.scale(self.scale);
+            frame.translate(Vector::new(
+                -self.image_size.width / 2.0,
+                -self.image_size.height / 2.0,
+            ));
+            frame.draw_image(
+                Rectangle::new(Point::ORIGIN, self.image_size),
+                GraphicsImage::new(&self.handle),
+            );
         });
-
-        vec![geometry]
+        vec![frame.into_geometry()]
     }
 
     fn mouse_interaction(
         &self,
-        interaction: &CanvasInteraction,
+        state: &CanvasInteraction,
         _bounds: Rectangle,
         _cursor: Cursor,
     ) -> Interaction {
-        if interaction.is_dragging {
+        if state.dragging.is_some() {
             Interaction::Grabbing
         } else {
             Interaction::Grab
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImageCanvas;
+    use iced::{Point, Size};
+
+    #[test]
+    fn zoom_keeps_the_cursor_anchor_fixed() {
+        let viewport = Size::new(800.0, 600.0);
+        let pan = Point::new(30.0, -20.0);
+        let cursor = Point::new(650.0, 180.0);
+        let new_pan = ImageCanvas::pan_for_zoom(pan, 1.0, 2.0, cursor, viewport);
+
+        let image_point = Point::new(
+            (cursor.x - viewport.width / 2.0 - pan.x) / 1.0,
+            (cursor.y - viewport.height / 2.0 - pan.y) / 1.0,
+        );
+        let after = Point::new(
+            viewport.width / 2.0 + new_pan.x + 2.0 * image_point.x,
+            viewport.height / 2.0 + new_pan.y + 2.0 * image_point.y,
+        );
+
+        assert!((after.x - cursor.x).abs() < f32::EPSILON);
+        assert!((after.y - cursor.y).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_fitting_image_can_still_be_panned() {
+        assert_eq!(
+            ImageCanvas::clamp_pan(
+                Point::new(50.0, -50.0),
+                1.0,
+                Size::new(400.0, 300.0),
+                Size::new(800.0, 600.0),
+            ),
+            Point::new(50.0, -50.0),
+        );
+    }
+
+    #[test]
+    fn pan_stops_before_the_image_leaves_the_viewport() {
+        assert_eq!(
+            ImageCanvas::clamp_pan(
+                Point::new(2_000.0, -2_000.0),
+                2.0,
+                Size::new(800.0, 600.0),
+                Size::new(800.0, 600.0),
+            ),
+            Point::new(1_200.0, -900.0),
+        );
     }
 }
